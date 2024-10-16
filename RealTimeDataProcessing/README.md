@@ -1,6 +1,3 @@
-Here’s the updated README in Markdown format with the command to run the Cassandra setup script and instructions on how
-to install Cassandra tools:
-
 # Scalable Real-Time Analytics System for Website Traffic
 
 This project demonstrates a **scalable real-time analytics system** built using **Apache Kafka**, **Apache Spark**, and
