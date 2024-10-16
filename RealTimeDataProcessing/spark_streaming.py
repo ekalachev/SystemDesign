@@ -1,14 +1,20 @@
-import requests
 from pyspark.sql import SparkSession
-from pyspark.sql.functions import from_json, col, udf, to_json, struct
+from pyspark.sql.functions import from_json, col, udf
 from pyspark.sql.types import StructType, StringType, TimestampType, IntegerType
 
 
-# 1. Create Spark session
-def create_spark_session(app_name: str, kafka_package: str) -> SparkSession:
+# 1. Create Spark session with Kafka and Cassandra integration
+def create_spark_session(app_name: str, kafka_package: str, cassandra_package: str) -> SparkSession:
     return SparkSession.builder \
-        .appName(app_name) \
-        .config("spark.jars.packages", kafka_package) \
+        .appName("WebsiteClickStreamProcessingWithCassandra") \
+        .config("spark.jars.packages", f"{kafka_package},{cassandra_package}") \
+        .config("spark.cassandra.connection.host", "localhost") \
+        .config("spark.cassandra.connection.port", "9042") \
+        .config("spark.sql.streaming.kafka.consumer.cache.timeout", "5000") \
+        .config("spark.sql.streaming.checkpointLocation", "/tmp/spark-checkpoints") \
+        .config("spark.ui.showConsoleProgress", "false") \
+        .config("spark.driver.memory", "4g") \
+        .config("spark.executor.memory", "4g") \
         .getOrCreate()
 
 
@@ -22,16 +28,7 @@ def define_clickstream_schema() -> StructType:
         .add("session_id", StringType())
 
 
-# 3. UDF to check if a page (domain) is alive by making an HTTP request
-def check_if_alive(url: str) -> bool:
-    try:
-        response = requests.head(url, timeout=3)  # Use HEAD request to check availability
-        return response.status_code == 200
-    except requests.RequestException:
-        return False
-
-
-# 4. UDF to calculate the length of the longest substring without repeating characters
+# 3. UDF to calculate the length of the longest substring without repeating characters
 def length_of_longest_substring(s: str) -> int:
     start = 0
     max_len = 0
@@ -46,15 +43,13 @@ def length_of_longest_substring(s: str) -> int:
     return max_len
 
 
-# 5. Register UDFs in Spark
+# 4. Register UDFs in Spark
 def register_udfs(spark: SparkSession):
     # Registering the UDF for calculating the longest substring length
     spark.udf.register("length_of_longest_substring_udf", length_of_longest_substring, IntegerType())
-    # The UDF for checking if the page is alive (uncomment if you want to use it)
-    # spark.udf.register("is_alive_udf", check_if_alive, BooleanType())
 
 
-# 6. Main Pipeline Function
+# 5. Main Pipeline Function
 def process_clickstream_data(spark: SparkSession):
     # Define the schema
     schema = define_clickstream_schema()
@@ -65,6 +60,7 @@ def process_clickstream_data(spark: SparkSession):
         .format("kafka") \
         .option("kafka.bootstrap.servers", "localhost:9093") \
         .option("subscribe", "website_clicks") \
+        .option("kafkaConsumer.pollTimeoutMs", "512000") \
         .load()
 
     # Cast the value from Kafka as string and parse JSON
@@ -86,31 +82,34 @@ def process_clickstream_data(spark: SparkSession):
         udf(length_of_longest_substring, IntegerType())(col("session_id"))
     )
 
-    # Convert the resulting DataFrame to JSON format
-    clickstream_json_df = clickstream_with_length_of_longest_substring_df.withColumn(
-        "json_output",
-        to_json(
-            struct(col("user_id"), col("page"), col("timestamp"), col("action"), col("length_of_longest_substring")))
-    )
+    # Drop the 'session_id' column as it is no longer needed
+    clickstream_cleaned_df = clickstream_with_length_of_longest_substring_df.drop("session_id")
 
-    # Write the resulting JSON DataFrame to the console
-    query = clickstream_json_df.select("json_output").writeStream \
+    # Write the resulting DataFrame to Cassandra
+    query = clickstream_cleaned_df.writeStream \
         .outputMode("append") \
-        .format("console") \
-        .option("truncate", "false") \
+        .option("checkpointLocation", "/tmp/spark-checkpoints") \
+        .foreachBatch(lambda df, epoch_id: df.write \
+                      .format("org.apache.spark.sql.cassandra") \
+                      .options(table="clicks", keyspace="clickstream_ks") \
+                      .mode("append") \
+                      .save()) \
         .start()
 
     query.awaitTermination()
 
 
-# 7. Entry Point
+# 6. Entry Point
 if __name__ == "__main__":
-    # Initialize Spark session
-    spark = create_spark_session("WebsiteClickStreamProcessingWithHealthCheck",
-                                 "org.apache.spark:spark-sql-kafka-0-10_2.12:3.1.2")
+    # Initialize Spark session with Kafka and Cassandra packages
+    spark = create_spark_session(
+        app_name="WebsiteClickStreamProcessingWithCassandra",
+        kafka_package="org.apache.spark:spark-sql-kafka-0-10_2.12:3.1.2",
+        cassandra_package="com.datastax.spark:spark-cassandra-connector_2.12:3.1.0"
+    )
 
     # Register UDFs
     register_udfs(spark)
 
-    # Process clickstream data
+    # Process clickstream data and write to Cassandra
     process_clickstream_data(spark)
